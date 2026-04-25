@@ -1,0 +1,502 @@
+
+local Players          = game:GetService("Players")
+local CoreGui          = game:GetService("CoreGui")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+
+-- ══════════════════════════════════════════════════════════════
+-- STATE
+-- ══════════════════════════════════════════════════════════════
+local farm = {
+    enabled      = false,
+    workerConn   = nil,
+    antiConn     = nil,
+    count        = 0,
+    status       = "Idle",
+    subStatus    = "",
+    DWELL_TIME   = 1.5,   -- giây đứng trên ticket
+    ANTI_RADIUS  = 20,    -- khoảng cách phát hiện player (stud)
+    ESCAPE_MIN   = 30,    -- khoảng cách TP tối thiểu khi né bot
+    ESCAPE_MAX   = 40,    -- khoảng cách TP tối đa khi né bot
+}
+
+-- ══════════════════════════════════════════════════════════════
+-- HELPERS
+-- ══════════════════════════════════════════════════════════════
+
+local function getHRP(char)
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getTicketPosition(model)
+    local h  = model:FindFirstChild("HumanoidRootPart")
+    if h  then return h.Position end
+    local pp = model.PrimaryPart
+    if pp then return pp.Position end
+    local bp = model:FindFirstChildWhichIsA("BasePart")
+    if bp then return bp.Position end
+    return nil
+end
+
+local function getActiveTickets()
+    local folder = workspace:FindFirstChild("Game")
+        and workspace.Game:FindFirstChild("Effects")
+        and workspace.Game.Effects:FindFirstChild("Tickets")
+    if not folder then return {} end
+    local list = {}
+    for _, model in pairs(folder:GetChildren()) do
+        if model:IsA("Model") then
+            local pos = getTicketPosition(model)
+            if pos then
+                table.insert(list, { model = model, position = pos })
+            end
+        end
+    end
+    return list
+end
+
+
+-- ── Cache NPC names từ ReplicatedStorage → NPCs (1 lần, event-driven) ──
+local npcNameCache = {}
+do
+    local npcFolder = game:GetService("ReplicatedStorage"):FindFirstChild("NPCs")
+    if npcFolder then
+        for _, obj in pairs(npcFolder:GetChildren()) do
+            npcNameCache[obj.Name] = true
+        end
+        npcFolder.ChildAdded:Connect(function(obj)
+            npcNameCache[obj.Name] = true
+        end)
+        npcFolder.ChildRemoved:Connect(function(obj)
+            npcNameCache[obj.Name] = nil
+        end)
+    end
+end
+
+-- ── Lấy vị trí 1 model trong Workspace.Game.Players ──────────
+local function getModelPos(model)
+    local h  = model:FindFirstChild("HumanoidRootPart")
+    if h  then return h.Position end
+    local pp = model.PrimaryPart
+    if pp then return pp.Position end
+    local bp = model:FindFirstChildWhichIsA("BasePart")
+    if bp then return bp.Position end
+    return nil
+end
+
+-- ── Tìm Bee trong Workspace → Game → Players ─────────────────
+local function findBeeInWorld()
+    local folder = workspace:FindFirstChild("Game")
+        and workspace.Game:FindFirstChild("Players")
+    if not folder then return nil end
+    for _, model in pairs(folder:GetChildren()) do
+        if model.Name == "Bee" then
+            local pos = getModelPos(model)
+            if pos then return pos end
+        end
+    end
+    return nil
+end
+
+-- ── Tìm bot gần nhất khớp NPC list (trừ Bee) ─────────────────
+local function getNearestBot(myPos)
+    local folder = workspace:FindFirstChild("Game")
+        and workspace.Game:FindFirstChild("Players")
+    if not folder then return nil end
+
+    local closest, closestDist = nil, math.huge
+
+    for _, model in pairs(folder:GetChildren()) do
+        if model.Name == "Bee" then continue end
+        if not npcNameCache[model.Name] then continue end
+        local pos = getModelPos(model)
+        if not pos then continue end
+        local d = (pos - myPos).Magnitude
+        if d < farm.ANTI_RADIUS and d < closestDist then
+            closestDist = d
+            closest     = pos
+        end
+    end
+    return closest
+end
+
+-- Safe TP
+local function tpTo(pos)
+    local c = player.Character
+    local h = getHRP(c)
+    if not h then return false end
+    pcall(function()
+        h.CFrame = CFrame.new(pos)
+        h.AssemblyLinearVelocity = Vector3.zero
+    end)
+    return true
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- ANTI-PLAYER LOOP (chạy song song)
+-- ══════════════════════════════════════════════════════════════
+local function startAntiPlayer()
+    if farm.antiConn then
+        pcall(function() task.cancel(farm.antiConn) end)
+    end
+    farm.antiConn = task.spawn(function()
+        while farm.enabled do
+            task.wait(0.15)
+            local c = player.Character
+            local h = getHRP(c)
+            if not h then continue end
+
+            local myPos  = h.Position
+            local beePos = findBeeInWorld()
+
+            -- Ưu tiên 1: Bee xuất hiện trong Workspace.Game.Players → TP thẳng đến Bee
+            if beePos then
+                tpTo(beePos + Vector3.new(0, 2, 0))
+                farm.subStatus = "BEE detected → TPed to Bee"
+                continue
+            end
+
+            -- Ưu tiên 2: Bot trong NPC list tiến gần → TP ngẫu nhiên xung quanh
+            --            liên tục đến khi không còn bot nào gần nữa
+            local botPos = getNearestBot(myPos)
+            if botPos then
+                local angle = math.random() * 2 * math.pi
+                local dist  = farm.ESCAPE_MIN
+                            + math.random() * (farm.ESCAPE_MAX - farm.ESCAPE_MIN)
+                local offset = Vector3.new(
+                    math.cos(angle) * dist,
+                    0,
+                    math.sin(angle) * dist
+                )
+                tpTo(botPos + offset)
+                farm.subStatus = "Bot nearby → evading..."
+            else
+                farm.subStatus = ""
+            end
+        end
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- TICKET FARM LOOP
+-- ══════════════════════════════════════════════════════════════
+local function startTicketFarm()
+    local c = player.Character
+    local h = getHRP(c)
+    if not h then
+        farm.status = "No character!"
+        return
+    end
+
+    farm.count  = 0
+    farm.status = "Scanning..."
+
+    if farm.workerConn then
+        pcall(function() task.cancel(farm.workerConn) end)
+    end
+
+    startAntiPlayer()
+
+    farm.workerConn = task.spawn(function()
+        while farm.enabled do
+            task.wait(0.3)
+
+            local c2 = player.Character
+            local h2 = getHRP(c2)
+            if not h2 then continue end
+
+            -- Nếu đang bị anti-player xử lý (có Bee / enemy) thì chờ
+            if farm.subStatus ~= "" then
+                farm.status = "⏸ " .. farm.subStatus
+                task.wait(0.5)
+                continue
+            end
+
+            local tickets = getActiveTickets()
+
+            if #tickets == 0 then
+                farm.status = "⏳ Waiting for tickets... | Total: " .. farm.count
+                continue
+            end
+
+            farm.status = "🎫 " .. #tickets .. " ticket(s) found!"
+
+            local myPos = h2.Position
+            table.sort(tickets, function(a, b)
+                return (a.position - myPos).Magnitude < (b.position - myPos).Magnitude
+            end)
+
+            for _, t in pairs(tickets) do
+                if not farm.enabled then break end
+                if not t.model or not t.model.Parent then continue end
+
+                -- Nếu anti-player đang hoạt động thì dừng collect tạm thời
+                if farm.subStatus ~= "" then break end
+
+                local pos = getTicketPosition(t.model)
+                if not pos then continue end
+
+                farm.status = "⚡ TP to ticket..."
+                tpTo(pos + Vector3.new(0, 2, 0))
+
+                farm.status = "⏳ Collecting..."
+                task.wait(farm.DWELL_TIME)
+
+                if not t.model or not t.model.Parent then
+                    farm.count  = farm.count + 1
+                    farm.status = "✓ Collected! Total: " .. farm.count
+                end
+            end
+        end
+
+        farm.status = "Stopped | Total: " .. farm.count
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- STOP ALL
+-- ══════════════════════════════════════════════════════════════
+local function stopAll()
+    farm.enabled = false
+    if farm.workerConn then
+        pcall(function() task.cancel(farm.workerConn) end)
+        farm.workerConn = nil
+    end
+    if farm.antiConn then
+        pcall(function() task.cancel(farm.antiConn) end)
+        farm.antiConn = nil
+    end
+    farm.status    = "Idle"
+    farm.subStatus = ""
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- UI
+-- ══════════════════════════════════════════════════════════════
+local sg = Instance.new("ScreenGui")
+sg.Name           = "TicketFarmUI"
+sg.ResetOnSpawn   = false
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.IgnoreGuiInset = true
+pcall(function() sg.Parent = CoreGui end)
+if not sg.Parent then sg.Parent = player.PlayerGui end
+
+local panel = Instance.new("Frame")
+panel.Name                   = "Panel"
+panel.Size                   = UDim2.fromOffset(230, 230)
+panel.Position               = UDim2.new(0.5, -115, 0.5, -115)
+panel.BackgroundColor3       = Color3.fromRGB(18, 18, 24)
+panel.BackgroundTransparency = 0.08
+panel.BorderSizePixel        = 0
+panel.Active                 = true
+panel.Parent                 = sg
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
+
+local stroke = Instance.new("UIStroke", panel)
+stroke.Color     = Color3.fromRGB(200, 0, 0)
+stroke.Thickness = 2
+
+-- Title bar
+local titleBar = Instance.new("Frame")
+titleBar.Size             = UDim2.new(1, 0, 0, 36)
+titleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+titleBar.BorderSizePixel  = 0
+titleBar.Parent           = panel
+Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 10)
+
+local titleLbl = Instance.new("TextLabel")
+titleLbl.Size                   = UDim2.new(1, -36, 1, 0)
+titleLbl.Position               = UDim2.new(0, 10, 0, 0)
+titleLbl.BackgroundTransparency = 1
+titleLbl.Text                   = "Auto Ticket Farm v2"
+titleLbl.TextColor3             = Color3.fromRGB(220, 220, 220)
+titleLbl.Font                   = Enum.Font.GothamBold
+titleLbl.TextSize               = 12
+titleLbl.TextXAlignment         = Enum.TextXAlignment.Left
+titleLbl.Parent                 = titleBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size             = UDim2.fromOffset(26, 26)
+closeBtn.Position         = UDim2.new(1, -30, 0, 5)
+closeBtn.BackgroundColor3 = Color3.fromRGB(180, 0, 0)
+closeBtn.BorderSizePixel  = 0
+closeBtn.Text             = "X"
+closeBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+closeBtn.Font             = Enum.Font.GothamBold
+closeBtn.TextSize         = 12
+closeBtn.Parent           = titleBar
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+closeBtn.MouseButton1Click:Connect(function()
+    stopAll()
+    sg:Destroy()
+end)
+
+-- Content
+local content = Instance.new("Frame")
+content.Size                   = UDim2.new(1, -16, 1, -44)
+content.Position               = UDim2.new(0, 8, 0, 40)
+content.BackgroundTransparency = 1
+content.Parent                 = panel
+
+local layout = Instance.new("UIListLayout", content)
+layout.SortOrder     = Enum.SortOrder.LayoutOrder
+layout.Padding       = UDim.new(0, 5)
+layout.FillDirection = Enum.FillDirection.Vertical
+
+-- Status chính
+local statusLbl = Instance.new("TextLabel")
+statusLbl.Size                   = UDim2.new(1, 0, 0, 32)
+statusLbl.BackgroundColor3       = Color3.fromRGB(25, 25, 35)
+statusLbl.BackgroundTransparency = 0.3
+statusLbl.Text                   = "Status: Idle"
+statusLbl.TextColor3             = Color3.fromRGB(200, 200, 200)
+statusLbl.Font                   = Enum.Font.Gotham
+statusLbl.TextSize               = 11
+statusLbl.TextWrapped            = true
+statusLbl.LayoutOrder            = 1
+statusLbl.Parent                 = content
+Instance.new("UICorner", statusLbl).CornerRadius = UDim.new(0, 6)
+
+-- Anti-player status
+local antiLbl = Instance.new("TextLabel")
+antiLbl.Size                   = UDim2.new(1, 0, 0, 26)
+antiLbl.BackgroundColor3       = Color3.fromRGB(40, 20, 20)
+antiLbl.BackgroundTransparency = 0.3
+antiLbl.Text                   = "Anti: --"
+antiLbl.TextColor3             = Color3.fromRGB(255, 160, 80)
+antiLbl.Font                   = Enum.Font.Gotham
+antiLbl.TextSize               = 11
+antiLbl.TextWrapped            = true
+antiLbl.LayoutOrder            = 2
+antiLbl.Parent                 = content
+Instance.new("UICorner", antiLbl).CornerRadius = UDim.new(0, 6)
+
+-- Count
+local countLbl = Instance.new("TextLabel")
+countLbl.Size                   = UDim2.new(1, 0, 0, 26)
+countLbl.BackgroundColor3       = Color3.fromRGB(25, 25, 35)
+countLbl.BackgroundTransparency = 0.3
+countLbl.Text                   = "Collected: 0"
+countLbl.TextColor3             = Color3.fromRGB(100, 220, 120)
+countLbl.Font                   = Enum.Font.GothamBold
+countLbl.TextSize               = 13
+countLbl.LayoutOrder            = 3
+countLbl.Parent                 = content
+Instance.new("UICorner", countLbl).CornerRadius = UDim.new(0, 6)
+
+-- Toggle button duy nhất
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size             = UDim2.new(1, 0, 0, 42)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 60)
+toggleBtn.BorderSizePixel  = 0
+toggleBtn.Text             = "Start"
+toggleBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+toggleBtn.Font             = Enum.Font.GothamBold
+toggleBtn.TextSize         = 14
+toggleBtn.LayoutOrder      = 4
+toggleBtn.Parent           = content
+Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 8)
+
+-- Reset counter
+local resetBtn = Instance.new("TextButton")
+resetBtn.Size             = UDim2.new(1, 0, 0, 26)
+resetBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
+resetBtn.BorderSizePixel  = 0
+resetBtn.Text             = "Reset Counter"
+resetBtn.TextColor3       = Color3.fromRGB(180, 180, 180)
+resetBtn.Font             = Enum.Font.Gotham
+resetBtn.TextSize         = 12
+resetBtn.LayoutOrder      = 5
+resetBtn.Parent           = content
+Instance.new("UICorner", resetBtn).CornerRadius = UDim.new(0, 8)
+
+-- Footer
+local footerLbl = Instance.new("TextLabel")
+footerLbl.Size                   = UDim2.new(1, 0, 0, 14)
+footerLbl.BackgroundTransparency = 1
+footerLbl.Text                   = "by KhoaProSigmaAlphaMale"
+footerLbl.TextColor3             = Color3.fromRGB(70, 70, 90)
+footerLbl.Font                   = Enum.Font.Gotham
+footerLbl.TextSize               = 10
+footerLbl.LayoutOrder            = 6
+footerLbl.Parent                 = content
+
+-- ── Button logic ──────────────────────────────────────────────
+toggleBtn.MouseButton1Click:Connect(function()
+    farm.enabled = not farm.enabled
+    if farm.enabled then
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(180, 0, 0)
+        toggleBtn.Text             = "Stop"
+        startTicketFarm()
+    else
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 60)
+        toggleBtn.Text             = "Start"
+        stopAll()
+    end
+end)
+
+resetBtn.MouseButton1Click:Connect(function()
+    farm.count = 0
+end)
+
+-- ── Status update loop ────────────────────────────────────────
+task.spawn(function()
+    while sg and sg.Parent do
+        task.wait(0.25)
+        pcall(function()
+            statusLbl.Text = "Status: " .. farm.status
+            if farm.subStatus ~= "" then
+                antiLbl.Text       = "Anti: " .. farm.subStatus
+                antiLbl.TextColor3 = Color3.fromRGB(255, 100, 80)
+            else
+                antiLbl.Text       = "Anti: Watching..."
+                antiLbl.TextColor3 = Color3.fromRGB(255, 160, 80)
+            end
+            countLbl.Text = "Collected: " .. farm.count
+        end)
+    end
+end)
+
+-- ── Draggable ─────────────────────────────────────────────────
+do
+    local dragging, dragStart, startPos = false, nil, nil
+
+    titleBar.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1
+        or inp.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            dragStart = inp.Position
+            startPos  = panel.Position
+        end
+    end)
+
+    titleBar.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1
+        or inp.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(inp)
+        if not dragging then return end
+        if inp.UserInputType ~= Enum.UserInputType.MouseMovement
+        and inp.UserInputType ~= Enum.UserInputType.Touch then return end
+        if not sg or not sg.Parent then return end
+        local delta = inp.Position - dragStart
+        panel.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end)
+end
+
+-- ── Survive respawn ───────────────────────────────────────────
+player.CharacterAdded:Connect(function()
+    if farm.enabled then
+        task.wait(1)
+        startTicketFarm()
+    end
+end)
